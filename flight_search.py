@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Flight search automation tool using the Amadeus API.
+"""Flight search automation tool using the Duffel API.
 
 Features:
 - Flexible departure date window around a target date (±N days)
 - Flexible trip durations (for round-trip searches)
 - Best-price summary by departure date
 - CSV and/or console output
-- API authentication handling
+- API bearer token authentication
 - Basic rate-limit and transient-error retries
 """
 
@@ -15,17 +15,18 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional
 
 import requests
 
 
-AMADUES_AUTH_URL = "https://test.api.amadeus.com/v1/security/oauth2/token"
-AMADUES_FLIGHT_OFFERS_URL = "https://test.api.amadeus.com/v2/shopping/flight-offers"
+DUFFEL_OFFER_REQUESTS_URL = "https://api.duffel.com/air/offer_requests"
+DUFFEL_API_VERSION = "v2"
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,23 @@ class SearchConfig:
     adults: int
     currency: str
     max_results_per_query: int
+    min_connections_per_slice: int
+    max_connections_per_slice: Optional[int]
     output_csv: Optional[str]
+
+
+@dataclass(frozen=True)
+class OfferSummary:
+    price: float
+    currency: str
+    offer_id: str
+    airlines: str
+    airports: str
+    flight_codes: str
+    flight_segments: str
+    layovers: str
+    total_duration: str
+    mode: str
 
 
 class ApiError(Exception):
@@ -51,35 +68,299 @@ class RateLimitError(ApiError):
     """Raised when the API rate limit has been reached and retries are exhausted."""
 
 
-class AmadeusClient:
-    def __init__(self, client_id: str, client_secret: str, session: Optional[requests.Session] = None) -> None:
-        self.client_id = client_id
-        self.client_secret = client_secret
+def api_error_message(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text[:300]
+
+    errors = payload.get("errors")
+    if not isinstance(errors, list):
+        return response.text[:300]
+
+    messages = []
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        title = error.get("title")
+        message = error.get("message")
+        if title and message:
+            messages.append(f"{title}: {message}")
+        elif message:
+            messages.append(message)
+        elif title:
+            messages.append(title)
+
+    return "; ".join(messages) if messages else response.text[:300]
+
+
+def cheapest_offers(offers: List[dict], limit: int) -> List[dict]:
+    def price_or_infinity(offer: dict) -> float:
+        try:
+            return float(offer["total_amount"])
+        except (KeyError, ValueError, TypeError):
+            return float("inf")
+
+    return sorted(offers, key=price_or_infinity)[:limit]
+
+
+def offer_mode(offer: dict) -> str:
+    live_mode = offer.get("live_mode", offer.get("_offer_request_live_mode"))
+    if live_mode is True:
+        return "live"
+    if live_mode is False:
+        return "test"
+    return "unknown"
+
+
+def connections_in_slice(flight_slice: dict) -> int:
+    segments = flight_slice.get("segments", [])
+    if not isinstance(segments, list):
+        return 0
+    return max(len([segment for segment in segments if isinstance(segment, dict)]) - 1, 0)
+
+
+def offer_meets_min_connections(offer: dict, min_connections_per_slice: int) -> bool:
+    if min_connections_per_slice <= 0:
+        return True
+
+    slices = offer.get("slices", [])
+    if not isinstance(slices, list) or not slices:
+        return False
+
+    for flight_slice in slices:
+        if not isinstance(flight_slice, dict):
+            return False
+        if connections_in_slice(flight_slice) < min_connections_per_slice:
+            return False
+
+    return True
+
+
+def offer_meets_max_connections(
+    offer: dict,
+    max_connections_per_slice: Optional[int],
+) -> bool:
+    if max_connections_per_slice is None:
+        return True
+
+    slices = offer.get("slices", [])
+    if not isinstance(slices, list) or not slices:
+        return False
+
+    for flight_slice in slices:
+        if not isinstance(flight_slice, dict):
+            return False
+        if connections_in_slice(flight_slice) > max_connections_per_slice:
+            return False
+
+    return True
+
+
+def parse_iso_duration_minutes(duration: str) -> Optional[int]:
+    match = re.fullmatch(
+        r"P(?:(?P<days>\d+)D)?T?(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?",
+        duration,
+    )
+    if not match:
+        return None
+
+    days = int(match.group("days") or 0)
+    hours = int(match.group("hours") or 0)
+    minutes = int(match.group("minutes") or 0)
+    return days * 24 * 60 + hours * 60 + minutes
+
+
+def format_duration(minutes: Optional[int]) -> str:
+    if minutes is None:
+        return "N/A"
+
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours and remaining_minutes:
+        return f"{hours}h {remaining_minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{remaining_minutes}m"
+
+
+def airport_label(airport: dict) -> str:
+    return airport.get("iata_code") or airport.get("name") or "unknown"
+
+
+def offer_segments(offer: dict) -> Iterable[dict]:
+    for flight_slice in offer.get("slices", []):
+        if not isinstance(flight_slice, dict):
+            continue
+        for segment in flight_slice.get("segments", []):
+            if isinstance(segment, dict):
+                yield segment
+
+
+def offer_airlines(offer: dict) -> str:
+    airlines: List[str] = []
+    seen = set()
+
+    for segment in offer_segments(offer):
+        carrier = segment.get("operating_carrier")
+        if not isinstance(carrier, dict):
+            continue
+        airline = carrier.get("name") or carrier.get("iata_code")
+        if airline and airline not in seen:
+            seen.add(airline)
+            airlines.append(airline)
+
+    return ", ".join(airlines) if airlines else "N/A"
+
+
+def offer_airports(offer: dict) -> str:
+    routes: List[str] = []
+
+    for flight_slice in offer.get("slices", []):
+        if not isinstance(flight_slice, dict):
+            continue
+        segments = [
+            segment for segment in flight_slice.get("segments", []) if isinstance(segment, dict)
+        ]
+        if not segments:
+            continue
+
+        route: List[str] = []
+        first_origin = segments[0].get("origin")
+        if isinstance(first_origin, dict):
+            route.append(airport_label(first_origin))
+
+        for segment in segments:
+            destination = segment.get("destination")
+            if isinstance(destination, dict):
+                route.append(airport_label(destination))
+
+        if route:
+            routes.append(" -> ".join(route))
+
+    return " / ".join(routes) if routes else "N/A"
+
+
+def carrier_code(carrier: object) -> Optional[str]:
+    if not isinstance(carrier, dict):
+        return None
+    return carrier.get("iata_code")
+
+
+def flight_code(carrier: object, flight_number: object) -> Optional[str]:
+    if not flight_number:
+        return None
+
+    code = carrier_code(carrier)
+    if code:
+        return f"{code}{flight_number}"
+
+    return str(flight_number)
+
+
+def segment_flight_code(segment: dict) -> Optional[str]:
+    marketing_code = flight_code(
+        segment.get("marketing_carrier"),
+        segment.get("marketing_carrier_flight_number"),
+    )
+    operating_code = flight_code(
+        segment.get("operating_carrier"),
+        segment.get("operating_carrier_flight_number"),
+    )
+
+    if marketing_code and operating_code and marketing_code != operating_code:
+        return f"{marketing_code} operated as {operating_code}"
+    if marketing_code:
+        return marketing_code
+    if operating_code:
+        return operating_code
+
+    return None
+
+
+def offer_flight_codes(offer: dict) -> str:
+    flight_codes = []
+
+    for segment in offer_segments(offer):
+        flight_code = segment_flight_code(segment)
+        if flight_code:
+            flight_codes.append(flight_code)
+
+    return ", ".join(flight_codes) if flight_codes else "N/A"
+
+
+def segment_route(segment: dict) -> str:
+    origin = segment.get("origin")
+    destination = segment.get("destination")
+    origin_label = airport_label(origin) if isinstance(origin, dict) else "unknown"
+    destination_label = airport_label(destination) if isinstance(destination, dict) else "unknown"
+    return f"{origin_label}->{destination_label}"
+
+
+def offer_flight_segments(offer: dict) -> str:
+    segment_details = []
+
+    for segment in offer_segments(offer):
+        flight_code = segment_flight_code(segment) or "N/A"
+        segment_details.append(f"{segment_route(segment)}: {flight_code}")
+
+    return "; ".join(segment_details) if segment_details else "N/A"
+
+
+def offer_layovers(offer: dict) -> str:
+    layover_airports: List[str] = []
+
+    for flight_slice in offer.get("slices", []):
+        if not isinstance(flight_slice, dict):
+            continue
+        segments = [
+            segment for segment in flight_slice.get("segments", []) if isinstance(segment, dict)
+        ]
+        for segment in segments[:-1]:
+            destination = segment.get("destination")
+            if isinstance(destination, dict):
+                layover_airports.append(airport_label(destination))
+
+    if not layover_airports:
+        return "0"
+    return f"{len(layover_airports)} ({', '.join(layover_airports)})"
+
+
+def offer_total_duration(offer: dict) -> str:
+    total_minutes = 0
+    found_duration = False
+
+    for flight_slice in offer.get("slices", []):
+        if not isinstance(flight_slice, dict):
+            continue
+        duration = flight_slice.get("duration")
+        if not isinstance(duration, str):
+            continue
+        minutes = parse_iso_duration_minutes(duration)
+        if minutes is None:
+            continue
+        total_minutes += minutes
+        found_duration = True
+
+    if found_duration:
+        return format_duration(total_minutes)
+
+    for segment in offer_segments(offer):
+        duration = segment.get("duration")
+        if not isinstance(duration, str):
+            continue
+        minutes = parse_iso_duration_minutes(duration)
+        if minutes is None:
+            continue
+        total_minutes += minutes
+        found_duration = True
+
+    return format_duration(total_minutes if found_duration else None)
+
+
+class DuffelClient:
+    def __init__(self, access_token: str, session: Optional[requests.Session] = None) -> None:
+        self.access_token = access_token
         self.session = session or requests.Session()
-        self.access_token: Optional[str] = None
-        self.token_expiry_epoch = 0.0
-
-    def authenticate(self) -> None:
-        payload = {
-            "grant_type": "client_credentials",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-        }
-        response = self.session.post(AMADUES_AUTH_URL, data=payload, timeout=30)
-
-        if response.status_code != 200:
-            raise ApiError(
-                f"Authentication failed ({response.status_code}): {response.text[:300]}"
-            )
-
-        token_data = response.json()
-        self.access_token = token_data["access_token"]
-        expires_in = int(token_data.get("expires_in", 0))
-        self.token_expiry_epoch = time.time() + max(expires_in - 60, 0)
-
-    def _ensure_token(self) -> None:
-        if not self.access_token or time.time() >= self.token_expiry_epoch:
-            self.authenticate()
 
     def search_offers(
         self,
@@ -89,46 +370,63 @@ class AmadeusClient:
         departure_date: date,
         return_date: Optional[date],
         adults: int,
-        currency: str,
         max_results: int,
         retries: int = 3,
     ) -> List[dict]:
-        self._ensure_token()
-        assert self.access_token, "Access token should be present after _ensure_token"
-
-        params = {
-            "originLocationCode": origin,
-            "destinationLocationCode": destination,
-            "departureDate": departure_date.isoformat(),
-            "adults": str(adults),
-            "currencyCode": currency,
-            "max": str(max_results),
-        }
+        slices = [
+            {
+                "origin": origin,
+                "destination": destination,
+                "departure_date": departure_date.isoformat(),
+            }
+        ]
         if return_date:
-            params["returnDate"] = return_date.isoformat()
+            slices.append(
+                {
+                    "origin": destination,
+                    "destination": origin,
+                    "departure_date": return_date.isoformat(),
+                }
+            )
 
-        headers = {"Authorization": f"Bearer {self.access_token}"}
+        payload = {
+            "data": {
+                "slices": slices,
+                "passengers": [{"type": "adult"} for _ in range(adults)],
+                "cabin_class": "economy",
+            }
+        }
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Duffel-Version": DUFFEL_API_VERSION,
+            "Authorization": f"Bearer {self.access_token}",
+        }
 
         for attempt in range(retries + 1):
-            response = self.session.get(
-                AMADUES_FLIGHT_OFFERS_URL,
-                params=params,
+            response = self.session.post(
+                DUFFEL_OFFER_REQUESTS_URL,
+                params={"return_offers": "true"},
+                json=payload,
                 headers=headers,
                 timeout=45,
             )
 
-            if response.status_code == 200:
-                payload = response.json()
-                return payload.get("data", [])
-
-            if response.status_code == 401 and attempt < retries:
-                # Token may have expired unexpectedly.
-                self.authenticate()
-                headers["Authorization"] = f"Bearer {self.access_token}"
-                continue
+            if response.status_code in (200, 201):
+                response_payload = response.json()
+                data = response_payload.get("data", {})
+                offers = data.get("offers", [])
+                for offer in offers:
+                    if isinstance(offer, dict):
+                        offer["_offer_request_live_mode"] = data.get("live_mode")
+                        offer["_offer_request_id"] = data.get("id")
+                return cheapest_offers(offers, max_results)
 
             if response.status_code == 429:
-                retry_after_header = response.headers.get("Retry-After", "2")
+                retry_after_header = response.headers.get("Retry-After") or response.headers.get(
+                    "ratelimit-reset", "2"
+                )
                 try:
                     retry_after_seconds = int(retry_after_header)
                 except ValueError:
@@ -141,7 +439,7 @@ class AmadeusClient:
 
                 raise RateLimitError(
                     "Rate limit reached and retries exhausted. "
-                    f"Last response: {response.text[:300]}"
+                    f"Last response: {api_error_message(response)}"
                 )
 
             if 500 <= response.status_code < 600 and attempt < retries:
@@ -149,7 +447,7 @@ class AmadeusClient:
                 continue
 
             raise ApiError(
-                f"Flight search failed ({response.status_code}): {response.text[:300]}"
+                f"Flight search failed ({response.status_code}): {api_error_message(response)}"
             )
 
         raise ApiError("Unexpected retry loop termination")
@@ -188,7 +486,11 @@ def parse_args() -> argparse.Namespace:
         help="Maximum trip duration in days for round-trip searches (default: 21)",
     )
     parser.add_argument("--adults", type=int, default=1, help="Number of adult travelers")
-    parser.add_argument("--currency", default="EUR", help="Currency code (default: EUR)")
+    parser.add_argument(
+        "--currency",
+        default="EUR",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--max-results-per-query",
         type=int,
@@ -196,18 +498,28 @@ def parse_args() -> argparse.Namespace:
         help="Max offers returned by API per query (default: 20)",
     )
     parser.add_argument(
+        "--min-connections-per-slice",
+        type=int,
+        default=0,
+        help=(
+            "Minimum connections required in every outbound/return slice. "
+            "Use 1 to exclude direct-looking offers."
+        ),
+    )
+    parser.add_argument(
+        "--max-connections-per-slice",
+        type=int,
+        default=2,
+        help="Maximum connections allowed in every outbound/return slice (default: 2).",
+    )
+    parser.add_argument(
         "--output-csv",
         help="Optional path to write CSV summary",
     )
     parser.add_argument(
-        "--amadeus-client-id",
-        default=os.getenv("AMADEUS_CLIENT_ID"),
-        help="Amadeus API key/client id (or set AMADEUS_CLIENT_ID)",
-    )
-    parser.add_argument(
-        "--amadeus-client-secret",
-        default=os.getenv("AMADEUS_CLIENT_SECRET"),
-        help="Amadeus API secret (or set AMADEUS_CLIENT_SECRET)",
+        "--duffel-access-token",
+        default=os.getenv("DUFFEL_ACCESS_TOKEN"),
+        help="Duffel API access token (or set DUFFEL_ACCESS_TOKEN)",
     )
 
     return parser.parse_args()
@@ -218,24 +530,41 @@ def date_range(center: date, flex_days: int) -> Iterable[date]:
         yield center + timedelta(days=offset)
 
 
-def best_offer_summary(offers: List[dict]) -> Optional[Tuple[float, str]]:
-    best_price: Optional[float] = None
-    best_offer_id = ""
+def best_offer_summary(
+    offers: List[dict],
+    min_connections_per_slice: int = 0,
+    max_connections_per_slice: Optional[int] = 2,
+) -> Optional[OfferSummary]:
+    best_summary: Optional[OfferSummary] = None
 
     for offer in offers:
+        if not offer_meets_min_connections(offer, min_connections_per_slice):
+            continue
+        if not offer_meets_max_connections(offer, max_connections_per_slice):
+            continue
+
         try:
-            price = float(offer["price"]["total"])
+            price = float(offer["total_amount"])
             offer_id = offer.get("id", "N/A")
+            currency = offer.get("total_currency", "")
         except (KeyError, ValueError, TypeError):
             continue
 
-        if best_price is None or price < best_price:
-            best_price = price
-            best_offer_id = offer_id
+        if best_summary is None or price < best_summary.price:
+            best_summary = OfferSummary(
+                price=price,
+                currency=currency,
+                offer_id=offer_id,
+                airlines=offer_airlines(offer),
+                airports=offer_airports(offer),
+                flight_codes=offer_flight_codes(offer),
+                flight_segments=offer_flight_segments(offer),
+                layovers=offer_layovers(offer),
+                total_duration=offer_total_duration(offer),
+                mode=offer_mode(offer),
+            )
 
-    if best_price is None:
-        return None
-    return best_price, best_offer_id
+    return best_summary
 
 
 def validate_config(args: argparse.Namespace) -> SearchConfig:
@@ -250,6 +579,15 @@ def validate_config(args: argparse.Namespace) -> SearchConfig:
         raise ValueError("--adults must be >= 1")
     if args.max_results_per_query < 1:
         raise ValueError("--max-results-per-query must be >= 1")
+    if args.min_connections_per_slice < 0:
+        raise ValueError("--min-connections-per-slice must be >= 0")
+    if args.max_connections_per_slice is not None and args.max_connections_per_slice < 0:
+        raise ValueError("--max-connections-per-slice must be >= 0")
+    if (
+        args.max_connections_per_slice is not None
+        and args.max_connections_per_slice < args.min_connections_per_slice
+    ):
+        raise ValueError("--max-connections-per-slice must be >= --min-connections-per-slice")
 
     min_duration = None if args.one_way else args.min_duration
     max_duration = None if args.one_way else args.max_duration
@@ -272,11 +610,13 @@ def validate_config(args: argparse.Namespace) -> SearchConfig:
         adults=args.adults,
         currency=args.currency.upper(),
         max_results_per_query=args.max_results_per_query,
+        min_connections_per_slice=args.min_connections_per_slice,
+        max_connections_per_slice=args.max_connections_per_slice,
         output_csv=args.output_csv,
     )
 
 
-def run_search(client: AmadeusClient, config: SearchConfig) -> List[Dict[str, str]]:
+def run_search(client: DuffelClient, config: SearchConfig) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
 
     for dep_date in date_range(config.target_date, config.date_flex_days):
@@ -288,7 +628,7 @@ def run_search(client: AmadeusClient, config: SearchConfig) -> List[Dict[str, st
                 dep_date + timedelta(days=d) for d in range(config.min_duration, config.max_duration + 1)
             ]
 
-        best_for_departure: Optional[Tuple[float, date, str]] = None
+        best_for_departure: Optional[tuple[OfferSummary, date]] = None
 
         for ret_date in return_dates:
             try:
@@ -298,7 +638,6 @@ def run_search(client: AmadeusClient, config: SearchConfig) -> List[Dict[str, st
                     departure_date=dep_date,
                     return_date=ret_date,
                     adults=config.adults,
-                    currency=config.currency,
                     max_results=config.max_results_per_query,
                 )
             except RateLimitError:
@@ -311,13 +650,16 @@ def run_search(client: AmadeusClient, config: SearchConfig) -> List[Dict[str, st
                 )
                 continue
 
-            summary = best_offer_summary(offers)
+            summary = best_offer_summary(
+                offers,
+                min_connections_per_slice=config.min_connections_per_slice,
+                max_connections_per_slice=config.max_connections_per_slice,
+            )
             if not summary:
                 continue
 
-            price, offer_id = summary
-            if best_for_departure is None or price < best_for_departure[0]:
-                best_for_departure = (price, ret_date if ret_date else dep_date, offer_id)
+            if best_for_departure is None or summary.price < best_for_departure[0].price:
+                best_for_departure = (summary, ret_date if ret_date else dep_date)
 
         row: Dict[str, str] = {
             "origin": config.origin,
@@ -325,12 +667,29 @@ def run_search(client: AmadeusClient, config: SearchConfig) -> List[Dict[str, st
             "departure_date": dep_date.isoformat(),
         }
         if best_for_departure:
-            row["best_price"] = f"{best_for_departure[0]:.2f}"
-            row["best_offer_id"] = best_for_departure[2]
+            summary = best_for_departure[0]
+            row["best_price"] = f"{summary.price:.2f}"
+            row["currency"] = summary.currency
+            row["airlines"] = summary.airlines
+            row["airports"] = summary.airports
+            row["flight_codes"] = summary.flight_codes
+            row["flight_segments"] = summary.flight_segments
+            row["layovers"] = summary.layovers
+            row["total_duration"] = summary.total_duration
+            row["mode"] = summary.mode
+            row["best_offer_id"] = summary.offer_id
             if not config.one_way:
                 row["best_return_date"] = best_for_departure[1].isoformat()
         else:
             row["best_price"] = "N/A"
+            row["currency"] = "N/A"
+            row["airlines"] = "N/A"
+            row["airports"] = "N/A"
+            row["flight_codes"] = "N/A"
+            row["flight_segments"] = "N/A"
+            row["layovers"] = "N/A"
+            row["total_duration"] = "N/A"
+            row["mode"] = "N/A"
             row["best_offer_id"] = "N/A"
             if not config.one_way:
                 row["best_return_date"] = "N/A"
@@ -343,15 +702,29 @@ def run_search(client: AmadeusClient, config: SearchConfig) -> List[Dict[str, st
 def print_summary(rows: List[Dict[str, str]], one_way: bool) -> None:
     print("\nBest flight prices by departure date")
     if one_way:
-        print("departure_date | best_price | offer_id")
+        print(
+            "departure_date | best_price | currency | airlines | airports | flight_codes | "
+            "flight_segments | layovers | total_duration | mode | offer_id"
+        )
         for row in rows:
-            print(f"{row['departure_date']} | {row['best_price']} | {row['best_offer_id']}")
+            print(
+                f"{row['departure_date']} | {row['best_price']} | "
+                f"{row['currency']} | {row['airlines']} | {row['airports']} | "
+                f"{row['flight_codes']} | {row['flight_segments']} | {row['layovers']} | "
+                f"{row['total_duration']} | {row['mode']} | {row['best_offer_id']}"
+            )
     else:
-        print("departure_date | best_return_date | best_price | offer_id")
+        print(
+            "departure_date | best_return_date | best_price | currency | airlines | airports | "
+            "flight_codes | flight_segments | layovers | total_duration | mode | offer_id"
+        )
         for row in rows:
             print(
                 f"{row['departure_date']} | {row['best_return_date']} | "
-                f"{row['best_price']} | {row['best_offer_id']}"
+                f"{row['best_price']} | {row['currency']} | {row['airlines']} | "
+                f"{row['airports']} | {row['flight_codes']} | {row['flight_segments']} | "
+                f"{row['layovers']} | {row['total_duration']} | {row['mode']} | "
+                f"{row['best_offer_id']}"
             )
 
 
@@ -359,7 +732,20 @@ def write_csv(rows: List[Dict[str, str]], csv_path: str, one_way: bool) -> None:
     fieldnames = ["origin", "destination", "departure_date"]
     if not one_way:
         fieldnames.append("best_return_date")
-    fieldnames.extend(["best_price", "best_offer_id"])
+    fieldnames.extend(
+        [
+            "best_price",
+            "currency",
+            "airlines",
+            "airports",
+            "flight_codes",
+            "flight_segments",
+            "layovers",
+            "total_duration",
+            "mode",
+            "best_offer_id",
+        ]
+    )
 
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -370,13 +756,19 @@ def write_csv(rows: List[Dict[str, str]], csv_path: str, one_way: bool) -> None:
 def main() -> int:
     args = parse_args()
 
-    if not args.amadeus_client_id or not args.amadeus_client_secret:
+    if not args.duffel_access_token:
         print(
-            "Missing API credentials. Provide --amadeus-client-id and "
-            "--amadeus-client-secret or set AMADEUS_CLIENT_ID/AMADEUS_CLIENT_SECRET.",
+            "Missing API credentials. Provide --duffel-access-token or set DUFFEL_ACCESS_TOKEN.",
             file=sys.stderr,
         )
         return 2
+
+    if args.duffel_access_token.startswith("duffel_test_"):
+        print(
+            "Warning: using a Duffel test token. Test mode can return unrealistic "
+            "schedules, prices, and flight numbers.",
+            file=sys.stderr,
+        )
 
     try:
         config = validate_config(args)
@@ -384,7 +776,7 @@ def main() -> int:
         print(f"Invalid arguments: {err}", file=sys.stderr)
         return 2
 
-    client = AmadeusClient(args.amadeus_client_id, args.amadeus_client_secret)
+    client = DuffelClient(args.duffel_access_token)
 
     try:
         rows = run_search(client, config)

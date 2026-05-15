@@ -1,6 +1,6 @@
 # Flight Search Tool (Python)
 
-This repository contains a Python automation script that searches flights with **flexible dates** and (for round-trips) **flexible trip duration** using the **Amadeus Flight Offers API**.
+This repository contains a Python automation script that searches flights with **flexible dates** and (for round-trips) **flexible trip duration** using the **Duffel Flight Offers API**.
 
 ## Features
 
@@ -8,8 +8,9 @@ This repository contains a Python automation script that searches flights with *
 - Flexible departure window around a target date (e.g., ±30 days)
 - Round-trip duration range (e.g., 5 to 21 days) or one-way mode
 - Best price summary for each departure date
+- Airline, airport route, flight code, layover, and total duration details for each best offer
 - CSV output and console summary
-- API authentication (OAuth2 client credentials)
+- API authentication (Duffel bearer token)
 - Error handling for:
   - Invalid input arguments
   - API rate limits (`429`) with retries
@@ -20,42 +21,43 @@ This repository contains a Python automation script that searches flights with *
 - Python 3.10+
 - `requests`
 
+## Setup
+
+Create and activate a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
 Install dependencies:
 
 ```bash
 pip install requests
 ```
 
-## API Credentials
-
-Set Amadeus credentials as environment variables:
+Set your Duffel access token as an environment variable:
 
 ```bash
-export AMADEUS_CLIENT_ID="your_client_id"
-export AMADEUS_CLIENT_SECRET="your_client_secret"
+export DUFFEL_ACCESS_TOKEN="..."
 ```
 
-Or pass them explicitly via CLI flags:
+You can also pass the token explicitly via CLI flag:
 
-- `--amadeus-client-id`
-- `--amadeus-client-secret`
+- `--duffel-access-token`
 
 ## Usage
 
 ### Round-trip flexible search
 
 ```bash
-python flight_search.py \
+python3 flight_search.py \
   --origin MIL \
   --destination LIM \
-  --target-date 2026-07-15 \
-  --date-flex-days 30 \
-  --min-duration 7 \
-  --max-duration 18 \
-  --adults 1 \
-  --currency EUR \
-  --max-results-per-query 20 \
-  --output-csv mil_lim_summary.csv
+  --target-date 2026-08-10 \
+  --date-flex-days 4 \
+  --min-duration 13 \
+  --max-duration 17
 ```
 
 ### One-way flexible search
@@ -81,6 +83,14 @@ Round-trip CSV columns:
 - `departure_date`
 - `best_return_date`
 - `best_price`
+- `currency`
+- `airlines`
+- `airports`
+- `flight_codes`
+- `flight_segments`
+- `layovers`
+- `total_duration`
+- `mode`
 - `best_offer_id`
 
 One-way CSV columns:
@@ -89,10 +99,22 @@ One-way CSV columns:
 - `destination`
 - `departure_date`
 - `best_price`
+- `currency`
+- `airlines`
+- `airports`
+- `flight_codes`
+- `flight_segments`
+- `layovers`
+- `total_duration`
+- `mode`
 - `best_offer_id`
 
 ## Notes
 
-- The script uses the Amadeus **test** environment URLs by default.
+- The script uses Duffel API v2 and creates offer requests with `return_offers=true`.
+- Duffel test tokens start with `duffel_test_`; test mode can return unrealistic schedules, prices, and flight numbers.
+- Duffel returns offer prices in your organisation's billing currency unless your account setup supports airline-provided currencies.
 - City codes like `MIL` may work depending on API support; airport-specific codes (e.g., `MXP`) can be used if needed.
-- If you hit rate limits, the script retries according to `Retry-After` when provided.
+- Use `--min-connections-per-slice 1` to exclude direct-looking offers for routes where direct flights should not exist.
+- The script defaults to `--max-connections-per-slice 2`, excluding offers with more than two layovers in any outbound or return slice.
+- If you hit rate limits, the script retries according to `Retry-After` or Duffel's `ratelimit-reset` header when provided.
